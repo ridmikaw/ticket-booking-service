@@ -19,7 +19,7 @@ COPY --from=builder /usr/local/bin/uvicorn /usr/local/bin/uvicorn
 COPY app/  ./app/
 
 # Optional: copy pre-built Next.js static export
-COPY frontend/out ./frontend/out 2>/dev/null || true
+COPY frontend/out ./frontend/out
 
 USER appuser
 EXPOSE 8000
