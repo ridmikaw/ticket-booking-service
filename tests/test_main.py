@@ -61,7 +61,14 @@ def test_cancel_ticket():
     book = client.post("/tickets/book", json=BOOK_PAYLOAD, headers=AUTH)
     assert book.status_code == 201
     ticket_id = book.json()["id"]
-    cancel = client.delete(f"/tickets/{ticket_id}", json={"reason": "Test"}, headers=AUTH)
+    import json
+    headers = AUTH.copy() if 'AUTH' in locals() or 'AUTH' in globals() else {}
+    headers['content-type'] = 'application/json'
+    cancel = client.delete(
+        f"/tickets/{ticket_id}",
+        data=json.dumps({"reason": "Test"}),
+        headers=headers
+    )
     assert cancel.status_code == 200
     assert "cancelled" in cancel.json()["message"].lower()
 
