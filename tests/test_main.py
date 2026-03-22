@@ -3,6 +3,9 @@ from app.main import app
 
 client = TestClient(app)
 
+# Auth header for protected routes
+AUTH = {"Authorization": "Bearer test-token"}
+
 # ── Health ─────────────────────────────────────────────────────────────────────
 def test_health():
     r = client.get("/health")
@@ -29,23 +32,20 @@ BOOK_PAYLOAD = {
 }
 
 def test_book_ticket():
-    r = client.post("/tickets/book", json=BOOK_PAYLOAD)
+    r = client.post("/tickets/book", json=BOOK_PAYLOAD, headers=AUTH)
     assert r.status_code == 201
     data = r.json()
     assert data["train_id"] == "TRN-002"
     assert data["status"] == "CONFIRMED"
     assert data["booking_ref"].startswith("BK-")
-    return data["id"]
 
 def test_book_same_passenger_twice():
-    """Same NIC should reuse existing passenger record."""
-    r1 = client.post("/tickets/book", json=BOOK_PAYLOAD)
-    r2 = client.post("/tickets/book", json={**BOOK_PAYLOAD, "seat_id": "S-06C"})
+    r1 = client.post("/tickets/book", json=BOOK_PAYLOAD, headers=AUTH)
+    r2 = client.post("/tickets/book", json={**BOOK_PAYLOAD, "seat_id": "S-06C"}, headers=AUTH)
     assert r1.status_code == 201
     assert r2.status_code == 201
     assert r1.json()["passenger_id"] == r2.json()["passenger_id"]
 
-# ── Get ticket ─────────────────────────────────────────────────────────────────
 def test_get_existing_ticket():
     from app.main import tickets_db
     ticket_id = list(tickets_db.keys())[0]
@@ -57,24 +57,22 @@ def test_get_nonexistent_ticket():
     r = client.get("/tickets/does-not-exist")
     assert r.status_code == 404
 
-# ── Cancel ticket ──────────────────────────────────────────────────────────────
 def test_cancel_ticket():
-    book = client.post("/tickets/book", json=BOOK_PAYLOAD)
+    book = client.post("/tickets/book", json=BOOK_PAYLOAD, headers=AUTH)
     assert book.status_code == 201
     ticket_id = book.json()["id"]
-
-    cancel = client.delete(f"/tickets/{ticket_id}", json={"reason": "Test cancellation"})
+    cancel = client.delete(f"/tickets/{ticket_id}", json={"reason": "Test"}, headers=AUTH)
     assert cancel.status_code == 200
     assert "cancelled" in cancel.json()["message"].lower()
 
 def test_cancel_already_cancelled():
-    book = client.post("/tickets/book", json=BOOK_PAYLOAD)
+    book = client.post("/tickets/book", json=BOOK_PAYLOAD, headers=AUTH)
+    assert book.status_code == 201
     ticket_id = book.json()["id"]
-    client.delete(f"/tickets/{ticket_id}")
-    r = client.delete(f"/tickets/{ticket_id}")
+    client.delete(f"/tickets/{ticket_id}", headers=AUTH)
+    r = client.delete(f"/tickets/{ticket_id}", headers=AUTH)
     assert r.status_code == 400
 
-# ── Get user tickets ───────────────────────────────────────────────────────────
 def test_get_user_tickets():
     r = client.get("/tickets/user/user-1")
     assert r.status_code == 200
@@ -86,7 +84,6 @@ def test_get_user_tickets_filtered_by_status():
     for t in r.json():
         assert t["status"] == "CONFIRMED"
 
-# ── Booking ────────────────────────────────────────────────────────────────────
 def test_get_booking():
     r = client.get("/bookings/BK-00001")
     assert r.status_code == 200
@@ -96,8 +93,7 @@ def test_get_booking_not_found():
     r = client.get("/bookings/BK-99999")
     assert r.status_code == 404
 
-# ── Passenger ──────────────────────────────────────────────────────────────────
 def test_get_passenger():
-    r = client.get("/passengers/P-001")
+    r = client.get("/passengers/P-001", headers=AUTH)
     assert r.status_code == 200
     assert r.json()["id"] == "P-001"
