@@ -1,20 +1,25 @@
-from fastapi import FastAPI, HTTPException, Depends, status, Query
+from fastapi import FastAPI, HTTPException, Depends, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field, EmailStr
+from pydantic import BaseModel, Field
 from typing import List, Optional
 from datetime import datetime
 from enum import Enum
-import httpx, os, logging, uuid
+import httpx, os, logging, uuid, json
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Ticket Booking Service",
-    description="Handles ticket reservation, generation, and passenger management for the Train Booking System.",
+    description="""
+    Handles ticket reservation and passenger bookings for the Train Booking System.
+
+    ## Integration Points
+    - **Train Management Service** → Verifies schedule via `GET /api/schedules/{id}`
+    - **Seat Availability Service** → Reserves seats via `PUT /api/seats/{scheduleId}/reserve`
+    - **Kafka** → Publishes `booking.created` and `booking.cancelled` events
+    """,
     version="1.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
@@ -31,100 +36,91 @@ app.add_middleware(
 
 security = HTTPBearer(auto_error=False)
 
-# ── Service URLs (injected via env) ──────────────────────────────────────────
-TRAIN_SERVICE_URL   = os.getenv("TRAIN_SERVICE_URL",   "http://train-service:8001")
-SEAT_SERVICE_URL    = os.getenv("SEAT_SERVICE_URL",    "http://seat-service:8002")
-PAYMENT_SERVICE_URL = os.getenv("PAYMENT_SERVICE_URL", "http://payment-service:8004")
+# ── Service URLs ──────────────────────────────────────────────────────────────
+TRAIN_SERVICE_URL = os.getenv("TRAIN_MANAGEMENT_URL",   "http://localhost:3001")
+SEAT_SERVICE_URL  = os.getenv("SEAT_AVAILABILITY_URL",  "http://localhost:3002")
+KAFKA_BROKER      = os.getenv("KAFKA_BROKER",           "localhost:9092")
+KAFKA_ENABLED     = os.getenv("KAFKA_ENABLED", "false").lower() == "true"
 
 # ── Enums ─────────────────────────────────────────────────────────────────────
-class TicketStatus(str, Enum):
+class SeatClass(str, Enum):
+    FIRST  = "FIRST"
+    SECOND = "SECOND"
+    THIRD  = "THIRD"
+
+class BookingStatus(str, Enum):
     PENDING   = "PENDING"
     CONFIRMED = "CONFIRMED"
     CANCELLED = "CANCELLED"
     COMPLETED = "COMPLETED"
 
-class SeatClass(str, Enum):
-    FIRST   = "1st Class"
-    SECOND  = "2nd Class"
-    SLEEPER = "Sleeper"
+class PaymentStatus(str, Enum):
+    UNPAID   = "UNPAID"
+    PAID     = "PAID"
+    REFUNDED = "REFUNDED"
 
-# ── In-memory DB (swap with SQLAlchemy + PostgreSQL in production) ────────────
-tickets_db: dict     = {}
-passengers_db: dict  = {}
-bookings_db: dict    = {}
+# ── In-memory store ───────────────────────────────────────────────────────────
+bookings_db: dict = {}
 
-# Seed data
-_t1 = str(uuid.uuid4())
-tickets_db[_t1] = {
-    "id": _t1, "train_id": "TRN-001", "seat_id": "S-12A",
-    "passenger_id": "P-001", "user_id": "user-1",
-    "seat_class": SeatClass.SECOND, "status": TicketStatus.CONFIRMED,
-    "departure": "Colombo Fort", "destination": "Kandy",
-    "departure_time": "2026-03-20T08:00:00", "arrival_time": "2026-03-20T11:30:00",
-    "price": 350.00, "booking_ref": "BK-00001",
-    "created_at": datetime.utcnow().isoformat(),
-}
-passengers_db["P-001"] = {
-    "id": "P-001", "name": "Ashan Perera", "email": "ashan@example.com",
-    "nic": "199012345678", "phone": "+94771234567",
-}
-bookings_db["BK-00001"] = {
-    "id": "BK-00001", "ticket_ids": [_t1], "user_id": "user-1",
-    "total_price": 350.00, "status": TicketStatus.CONFIRMED,
-    "created_at": datetime.utcnow().isoformat(),
-}
+def generate_booking_ref() -> str:
+    return f"BK-{str(uuid.uuid4())[:8].upper()}"
 
-# ── Pydantic Models ───────────────────────────────────────────────────────────
-class PassengerCreate(BaseModel):
-    name:  str   = Field(..., min_length=2, max_length=100)
-    email: str   = Field(..., description="Passenger email")
-    nic:   str   = Field(..., min_length=10, max_length=12)
-    phone: str   = Field(..., min_length=10)
+# ── Pydantic Models (matching Node.js schema exactly) ────────────────────────
+class Passenger(BaseModel):
+    name:       str  = Field(..., min_length=1)
+    email:      str  = Field(..., description="Passenger email")
+    phone:      str  = Field(..., min_length=1)
+    nationalId: Optional[str] = None
+    age:        Optional[int] = Field(None, ge=0)
+    seatNumber: Optional[str] = None
 
-class PassengerResponse(BaseModel):
-    id:    str
-    name:  str
-    email: str
-    nic:   str
-    phone: str
-
-class TicketBookRequest(BaseModel):
-    train_id:       str        = Field(..., description="Train ID from Train Management Service")
-    seat_id:        str        = Field(..., description="Seat ID from Seat Availability Service")
-    seat_class:     SeatClass
-    departure:      str
-    destination:    str
-    departure_time: str
-    arrival_time:   str
-    price:          float      = Field(..., gt=0)
-    passenger:      PassengerCreate
-
-class TicketResponse(BaseModel):
-    id:             str
-    train_id:       str
-    seat_id:        str
-    passenger_id:   str
-    user_id:        str
-    seat_class:     str
-    status:         str
-    departure:      str
-    destination:    str
-    departure_time: str
-    arrival_time:   str
-    price:          float
-    booking_ref:    str
-    created_at:     str
+class BookingCreate(BaseModel):
+    scheduleId:   str        = Field(..., description="Schedule ID from Train Management Service")
+    trainId:      str        = Field(..., description="Train ID from Train Management Service")
+    seatClass:    SeatClass
+    passengers:   List[Passenger] = Field(..., min_length=1)
+    contactEmail: str
+    journeyDate:  str        = Field(..., description="ISO date e.g. 2026-04-01")
+    origin:       str
+    destination:  str
 
 class BookingResponse(BaseModel):
-    id:          str
-    ticket_ids:  List[str]
-    user_id:     str
-    total_price: float
-    status:      str
-    created_at:  str
+    id:               str
+    bookingReference: str
+    scheduleId:       str
+    trainId:          str
+    seatClass:        str
+    passengers:       List[dict]
+    totalAmount:      float
+    status:           str
+    paymentStatus:    str
+    contactEmail:     str
+    journeyDate:      str
+    origin:           str
+    destination:      str
+    cancelledAt:      Optional[str] = None
+    cancelReason:     Optional[str] = None
+    createdAt:        str
+    updatedAt:        str
 
 class CancelRequest(BaseModel):
-    reason: Optional[str] = "Cancelled by user"
+    reason: Optional[str] = "User requested cancellation"
+
+# ── Kafka Publisher ───────────────────────────────────────────────────────────
+async def publish_event(topic: str, message: dict):
+    """Publish event to Kafka — same topics as Node.js service."""
+    if not KAFKA_ENABLED:
+        logger.info(f"[kafka] Disabled — skipping publish to {topic}: {message}")
+        return
+    try:
+        from aiokafka import AIOKafkaProducer
+        producer = AIOKafkaProducer(bootstrap_servers=KAFKA_BROKER)
+        await producer.start()
+        await producer.send_and_wait(topic, json.dumps(message).encode())
+        await producer.stop()
+        logger.info(f"[kafka] Published to {topic}")
+    except Exception as e:
+        logger.error(f"[kafka] Failed to publish to {topic}: {e}")
 
 # ── Auth helper ───────────────────────────────────────────────────────────────
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
@@ -139,195 +135,246 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
             if r.status_code == 200:
                 return r.json()
     except httpx.RequestError:
-        logger.warning("Auth service unreachable — running in standalone mode")
-    # Standalone fallback (for demo / when auth service is down)
+        logger.warning("Train Service unreachable — standalone mode")
     return {"user_id": "standalone-user", "role": "user"}
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-async def call_seat_reserve(seat_id: str, train_id: str):
-    """Integration: Call Seat Availability Service to reserve a seat."""
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            r = await client.post(
-                f"{SEAT_SERVICE_URL}/seats/reserve",
-                json={"seat_id": seat_id, "train_id": train_id}
-            )
-            return r.status_code == 200
-    except httpx.RequestError:
-        logger.warning("Seat service unreachable — assuming seat available in demo mode")
-        return True
-
-async def call_seat_release(seat_id: str, train_id: str):
-    """Integration: Release a reserved seat back to Seat Availability Service."""
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            await client.post(
-                f"{SEAT_SERVICE_URL}/seats/release",
-                json={"seat_id": seat_id, "train_id": train_id}
-            )
-    except httpx.RequestError:
-        logger.warning("Seat service unreachable — seat release skipped")
-
-async def call_payment_refund(booking_ref: str, amount: float):
-    """Integration: Request refund from Payment Service on cancellation."""
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            r = await client.post(
-                f"{PAYMENT_SERVICE_URL}/payments/refund",
-                json={"booking_ref": booking_ref, "amount": amount}
-            )
-            return r.status_code == 200
-    except httpx.RequestError:
-        logger.warning("Payment service unreachable — refund queued")
-        return True
-
-def generate_booking_ref():
-    return f"BK-{str(len(bookings_db) + 1).zfill(5)}"
-
-def generate_passenger_id():
-    return f"P-{str(len(passengers_db) + 1).zfill(4)}"
-
-# ── Routes ────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════
+# ROUTES
+# ══════════════════════════════════════════════════════════════════
 
 @app.get("/health", tags=["Health"])
 def health():
-    return {"status": "healthy", "service": "ticket-booking", "version": "1.0.0"}
-
-
-# ── Ticket endpoints ──────────────────────────────────────────────────────────
-
-@app.post("/tickets/book", response_model=TicketResponse, status_code=201, tags=["Tickets"],
-          summary="Book a new ticket")
-async def book_ticket(req: TicketBookRequest, user=Depends(get_current_user)):
-    """
-    Books a ticket. This endpoint:
-    1. Creates or looks up the passenger record
-    2. Calls Seat Availability Service to reserve the seat (prevents double booking)
-    3. Creates the ticket and booking records
-    4. Returns ticket details with booking reference
-    """
-    # Step 1: Create / find passenger
-    existing = next((p for p in passengers_db.values() if p["nic"] == req.passenger.nic), None)
-    if existing:
-        passenger_id = existing["id"]
-    else:
-        passenger_id = generate_passenger_id()
-        passengers_db[passenger_id] = {"id": passenger_id, **req.passenger.dict()}
-        logger.info(f"New passenger created: {passenger_id}")
-
-    # Step 2: Reserve seat via Seat Availability Service
-    seat_ok = await call_seat_reserve(req.seat_id, req.train_id)
-    if not seat_ok:
-        raise HTTPException(status_code=409, detail="Seat is no longer available")
-
-    # Step 3: Create ticket
-    ticket_id   = str(uuid.uuid4())
-    booking_ref = generate_booking_ref()
-    user_id     = user.get("user_id", "unknown")
-
-    ticket = {
-        "id": ticket_id, "train_id": req.train_id, "seat_id": req.seat_id,
-        "passenger_id": passenger_id, "user_id": user_id,
-        "seat_class": req.seat_class, "status": TicketStatus.CONFIRMED,
-        "departure": req.departure, "destination": req.destination,
-        "departure_time": req.departure_time, "arrival_time": req.arrival_time,
-        "price": req.price, "booking_ref": booking_ref,
-        "created_at": datetime.utcnow().isoformat(),
-    }
-    tickets_db[ticket_id] = ticket
-
-    # Step 4: Create booking record
-    bookings_db[booking_ref] = {
-        "id": booking_ref, "ticket_ids": [ticket_id], "user_id": user_id,
-        "total_price": req.price, "status": TicketStatus.CONFIRMED,
-        "created_at": datetime.utcnow().isoformat(),
+    return {
+        "status":    "healthy",
+        "service":   "ticket-booking",
+        "timestamp": datetime.utcnow().isoformat(),
+        "uptime":    "running",
     }
 
-    logger.info(f"Ticket booked: {ticket_id} | Booking: {booking_ref}")
-    return ticket
+# ── GET /api/bookings ─────────────────────────────────────────────────────────
+@app.get("/api/bookings", tags=["Bookings"],
+         summary="List bookings filtered by email or status")
+def get_all_bookings(
+    email:  Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    page:   int = Query(1, ge=1),
+    limit:  int = Query(20, ge=1, le=100),
+):
+    """List bookings, optionally filtered by email or status. Paginated."""
+    results = list(bookings_db.values())
 
-
-@app.get("/tickets/{ticket_id}", response_model=TicketResponse, tags=["Tickets"],
-         summary="Get ticket by ID")
-def get_ticket(ticket_id: str):
-    """Get a single ticket's full details by its ID."""
-    if ticket_id not in tickets_db:
-        raise HTTPException(status_code=404, detail="Ticket not found")
-    return tickets_db[ticket_id]
-
-
-@app.delete("/tickets/{ticket_id}", tags=["Tickets"], summary="Cancel a ticket")
-async def cancel_ticket(ticket_id: str, req: CancelRequest = CancelRequest(),
-                        user=Depends(get_current_user)):
-    """
-    Cancels a ticket. This endpoint:
-    1. Validates ticket exists and is cancellable
-    2. Releases the seat back to Seat Availability Service
-    3. Requests refund from Payment Service
-    4. Updates ticket status to CANCELLED
-    """
-    if ticket_id not in tickets_db:
-        raise HTTPException(status_code=404, detail="Ticket not found")
-
-    ticket = tickets_db[ticket_id]
-    if ticket["status"] == TicketStatus.CANCELLED:
-        raise HTTPException(status_code=400, detail="Ticket is already cancelled")
-    if ticket["status"] == TicketStatus.COMPLETED:
-        raise HTTPException(status_code=400, detail="Cannot cancel a completed ticket")
-
-    # Release seat
-    await call_seat_release(ticket["seat_id"], ticket["train_id"])
-
-    # Request refund
-    await call_payment_refund(ticket["booking_ref"], ticket["price"])
-
-    # Update status
-    tickets_db[ticket_id]["status"] = TicketStatus.CANCELLED
-    bookings_db[ticket["booking_ref"]]["status"] = TicketStatus.CANCELLED
-
-    logger.info(f"Ticket cancelled: {ticket_id} | Reason: {req.reason}")
-    return {"message": f"Ticket {ticket_id} cancelled successfully", "booking_ref": ticket["booking_ref"]}
-
-
-@app.get("/tickets/user/{user_id}", response_model=List[TicketResponse], tags=["Tickets"],
-         summary="Get all tickets for a user")
-def get_user_tickets(user_id: str, status: Optional[str] = None):
-    """Get all tickets belonging to a user, optionally filtered by status."""
-    user_tickets = [t for t in tickets_db.values() if t["user_id"] == user_id]
+    if email:
+        results = [b for b in results if b["contactEmail"] == email.lower()]
     if status:
-        user_tickets = [t for t in user_tickets if t["status"] == status.upper()]
-    return user_tickets
+        results = [b for b in results if b["status"] == status.upper()]
 
+    # Sort by createdAt descending
+    results.sort(key=lambda x: x["createdAt"], reverse=True)
 
-# ── Booking endpoints ─────────────────────────────────────────────────────────
+    total = len(results)
+    start = (page - 1) * limit
+    results = results[start: start + limit]
 
-@app.get("/bookings/{booking_ref}", response_model=BookingResponse, tags=["Bookings"],
-         summary="Get booking by reference")
-def get_booking(booking_ref: str):
-    """Get a booking record by its reference number (e.g. BK-00001)."""
-    if booking_ref not in bookings_db:
+    return {"success": True, "total": total, "page": page, "data": results}
+
+# ── GET /api/bookings/ref/:reference ─────────────────────────────────────────
+@app.get("/api/bookings/ref/{reference}", tags=["Bookings"],
+         summary="Get booking by booking reference number")
+def get_booking_by_reference(reference: str):
+    """Get booking by reference e.g. BK-A1B2C3D4"""
+    booking = next(
+        (b for b in bookings_db.values()
+         if b["bookingReference"] == reference.upper()), None
+    )
+    if not booking:
         raise HTTPException(status_code=404, detail="Booking not found")
-    return bookings_db[booking_ref]
+    return {"success": True, "data": booking}
 
+# ── GET /api/bookings/:id ─────────────────────────────────────────────────────
+@app.get("/api/bookings/{booking_id}", tags=["Bookings"],
+         summary="Get booking by ID")
+def get_booking_by_id(booking_id: str):
+    if booking_id not in bookings_db:
+        raise HTTPException(status_code=404, detail="Booking not found")
+    return {"success": True, "data": bookings_db[booking_id]}
 
-# ── Passenger endpoints ───────────────────────────────────────────────────────
+# ── POST /api/bookings ────────────────────────────────────────────────────────
+@app.post("/api/bookings", status_code=201, tags=["Bookings"],
+          summary="Create a new ticket booking")
+async def create_booking(req: BookingCreate):
+    """
+    Orchestrates the full booking flow:
+    1. Validates the schedule via Train Management Service
+    2. Reserves seats via Seat Availability Service
+    3. Calculates fare and saves booking
+    4. Publishes `booking.created` Kafka event
+    """
+    # Step 1: Verify schedule via Train Management Service
+    schedule_info = None
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.get(f"{TRAIN_SERVICE_URL}/api/schedules/{req.scheduleId}")
+            if r.status_code == 200:
+                schedule_info = r.json().get("data")
+            if schedule_info and schedule_info.get("status") == "CANCELLED":
+                raise HTTPException(status_code=400, detail="This schedule has been cancelled")
+    except HTTPException:
+        raise
+    except httpx.RequestError:
+        logger.warning("Train Service unreachable — continuing in demo mode")
 
-@app.get("/passengers/{passenger_id}", response_model=PassengerResponse, tags=["Passengers"],
-         summary="Get passenger info")
-def get_passenger(passenger_id: str, user=Depends(get_current_user)):
-    if passenger_id not in passengers_db:
-        raise HTTPException(status_code=404, detail="Passenger not found")
-    return passengers_db[passenger_id]
+    # Step 2: Reserve seats via Seat Availability Service
+    seat_count     = len(req.passengers)
+    reserved_seats = []
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.put(
+                f"{SEAT_SERVICE_URL}/api/seats/{req.scheduleId}/reserve",
+                json={
+                    "bookingId":   "TEMP",
+                    "seatClass":   req.seatClass,
+                    "seatCount":   seat_count,
+                    "passengerId": req.contactEmail,
+                }
+            )
+            if r.status_code == 200:
+                reserved_seats = r.json().get("data", {}).get("reservedSeats", [])
+            elif r.status_code == 409:
+                raise HTTPException(status_code=409,
+                    detail=r.json().get("message", "No seats available"))
+    except HTTPException:
+        raise
+    except httpx.RequestError:
+        logger.warning("Seat Service unreachable — continuing in demo mode")
 
+    # Step 3: Calculate fare
+    total_amount = 0.0
+    if schedule_info:
+        classes    = schedule_info.get("trainId", {}).get("classes", [])
+        class_info = next((c for c in classes if c["className"] == req.seatClass), None)
+        price_per_km = class_info["pricePerKm"] if class_info else 2.5
+        distance_km  = schedule_info.get("distanceKm", 0)
+        total_amount = round(distance_km * price_per_km * seat_count, 2)
+    else:
+        # Fallback pricing when Train Service is down
+        fallback = {"FIRST": 5.0, "SECOND": 2.5, "THIRD": 1.5}
+        total_amount = round(100 * fallback.get(req.seatClass, 2.5) * seat_count, 2)
 
-# ── Serve Next.js frontend ────────────────────────────────────────────────────
-FRONTEND_DIR = os.path.join(os.path.dirname(__file__), "..", "frontend", "out")
-if os.path.isdir(FRONTEND_DIR):
-    app.mount("/ui", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")
+    # Step 4: Assign seat numbers to passengers
+    passengers_with_seats = []
+    for i, p in enumerate(req.passengers):
+        passenger_dict = p.dict()
+        if i < len(reserved_seats):
+            passenger_dict["seatNumber"] = reserved_seats[i].get("seatNumber")
+        passengers_with_seats.append(passenger_dict)
 
-@app.get("/", include_in_schema=False)
-def root():
-    index = os.path.join(FRONTEND_DIR, "index.html")
-    if os.path.exists(index):
-        return FileResponse(index)
-    return {"service": "Ticket Booking Service", "docs": "/docs", "version": "1.0.0"}
+    # Step 5: Create booking record
+    booking_id  = str(uuid.uuid4())
+    booking_ref = generate_booking_ref()
+    now         = datetime.utcnow().isoformat()
+
+    booking = {
+        "id":               booking_id,
+        "bookingReference": booking_ref,
+        "scheduleId":       req.scheduleId,
+        "trainId":          req.trainId,
+        "seatClass":        req.seatClass,
+        "passengers":       passengers_with_seats,
+        "totalAmount":      total_amount,
+        "status":           BookingStatus.CONFIRMED,
+        "paymentStatus":    PaymentStatus.UNPAID,
+        "contactEmail":     req.contactEmail.lower(),
+        "journeyDate":      req.journeyDate,
+        "origin":           req.origin,
+        "destination":      req.destination,
+        "cancelledAt":      None,
+        "cancelReason":     None,
+        "createdAt":        now,
+        "updatedAt":        now,
+    }
+    bookings_db[booking_id] = booking
+
+    # Step 6: Update seat reservation with real booking ID
+    if reserved_seats:
+        try:
+            async with httpx.AsyncClient(timeout=3.0) as client:
+                await client.put(
+                    f"{SEAT_SERVICE_URL}/api/seats/{req.scheduleId}/reserve",
+                    json={"bookingId": booking_id, "seatClass": req.seatClass, "seatCount": 0}
+                )
+        except Exception:
+            pass  # non-critical
+
+    # Step 7: Publish booking.created Kafka event
+    await publish_event("booking.created", {
+        "bookingId":        booking_id,
+        "bookingReference": booking_ref,
+        "contactEmail":     booking["contactEmail"],
+        "passengers":       [{"name": p["name"], "email": p["email"],
+                               "seatNumber": p.get("seatNumber")}
+                              for p in passengers_with_seats],
+        "origin":           req.origin,
+        "destination":      req.destination,
+        "journeyDate":      req.journeyDate,
+        "seatClass":        req.seatClass,
+        "totalAmount":      total_amount,
+        "scheduleId":       req.scheduleId,
+    })
+
+    logger.info(f"Booking created: {booking_id} | Ref: {booking_ref}")
+    return {"success": True, "data": booking}
+
+# ── DELETE /api/bookings/:id ──────────────────────────────────────────────────
+@app.delete("/api/bookings/{booking_id}", tags=["Bookings"],
+            summary="Cancel a booking")
+async def cancel_booking(booking_id: str, req: CancelRequest = CancelRequest()):
+    """
+    Cancels the booking, releases seats via Seat Availability Service,
+    and publishes `booking.cancelled` Kafka event.
+    """
+    if booking_id not in bookings_db:
+        raise HTTPException(status_code=404, detail="Booking not found")
+
+    booking = bookings_db[booking_id]
+
+    if booking["status"] in ["CANCELLED", "COMPLETED"]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Booking is already {booking['status'].lower()}"
+        )
+
+    # Step 1: Release seats
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            await client.put(
+                f"{SEAT_SERVICE_URL}/api/seats/{booking['scheduleId']}/release",
+                json={
+                    "bookingId": booking_id,
+                    "seatClass": booking["seatClass"],
+                    "seatCount": len(booking["passengers"]),
+                }
+            )
+    except httpx.RequestError:
+        logger.warning("Seat Service unreachable — seat release skipped (non-fatal)")
+
+    # Step 2: Update booking
+    now = datetime.utcnow().isoformat()
+    bookings_db[booking_id]["status"]       = BookingStatus.CANCELLED
+    bookings_db[booking_id]["cancelledAt"]  = now
+    bookings_db[booking_id]["cancelReason"] = req.reason
+    bookings_db[booking_id]["updatedAt"]    = now
+
+    # Step 3: Publish booking.cancelled Kafka event
+    await publish_event("booking.cancelled", {
+        "bookingId":        booking_id,
+        "bookingReference": booking["bookingReference"],
+        "scheduleId":       booking["scheduleId"],
+        "seatClass":        booking["seatClass"],
+        "seatCount":        len(booking["passengers"]),
+        "contactEmail":     booking["contactEmail"],
+        "totalAmount":      booking["totalAmount"],
+    })
+
+    logger.info(f"Booking cancelled: {booking_id}")
+    return {"success": True, "message": "Booking cancelled",
+            "data": bookings_db[booking_id]}
