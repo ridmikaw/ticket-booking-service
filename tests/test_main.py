@@ -3,9 +3,6 @@ from app.main import app
 
 client = TestClient(app)
 
-# Auth header for protected routes
-AUTH = {"Authorization": "Bearer test-token"}
-
 # ── Health ─────────────────────────────────────────────────────────────────────
 def test_health():
     r = client.get("/health")
@@ -13,93 +10,152 @@ def test_health():
     assert r.json()["status"] == "healthy"
     assert r.json()["service"] == "ticket-booking"
 
-# ── Book ticket ────────────────────────────────────────────────────────────────
+# ── Booking payload matching Node.js schema ───────────────────────────────────
 BOOK_PAYLOAD = {
-    "train_id":       "TRN-002",
-    "seat_id":        "S-05B",
-    "seat_class":     "2nd Class",
-    "departure":      "Colombo Fort",
-    "destination":    "Galle",
-    "departure_time": "2026-04-01T09:00:00",
-    "arrival_time":   "2026-04-01T12:00:00",
-    "price":          280.00,
-    "passenger": {
-        "name":  "Nimal Silva",
-        "email": "nimal@example.com",
-        "nic":   "200112345678",
-        "phone": "+94771111111"
-    }
+    "scheduleId":   "65f1a2b3c4d5e6f7a8b9c0d1",
+    "trainId":      "69f47db02ccda6e75e7ead60",
+    "seatClass":    "SECOND",
+    "contactEmail": "ridmi@gmail.com",
+    "journeyDate":  "2026-04-01",
+    "origin":       "Colombo Fort",
+    "destination":  "Kandy",
+    "passengers": [
+        {
+            "name":       "Ridmi Ranasinghe",
+            "email":      "ridmi@gmail.com",
+            "phone":      "+94770791180",
+            "nationalId": "200257900923",
+            "age":        23
+        }
+    ]
 }
 
-def test_book_ticket():
-    r = client.post("/tickets/book", json=BOOK_PAYLOAD, headers=AUTH)
+# ── Create Booking ─────────────────────────────────────────────────────────────
+def test_create_booking():
+    r = client.post("/api/bookings", json=BOOK_PAYLOAD)
     assert r.status_code == 201
     data = r.json()
-    assert data["train_id"] == "TRN-002"
-    assert data["status"] == "CONFIRMED"
-    assert data["booking_ref"].startswith("BK-")
+    assert data["success"] is True
+    assert data["data"]["bookingReference"].startswith("BK-")
+    assert data["data"]["status"] == "CONFIRMED"
+    assert data["data"]["seatClass"] == "SECOND"
+    assert data["data"]["origin"] == "Colombo Fort"
+    assert data["data"]["destination"] == "Kandy"
+    assert len(data["data"]["passengers"]) == 1
+    return data["data"]["id"], data["data"]["bookingReference"]
 
-def test_book_same_passenger_twice():
-    r1 = client.post("/tickets/book", json=BOOK_PAYLOAD, headers=AUTH)
-    r2 = client.post("/tickets/book", json={**BOOK_PAYLOAD, "seat_id": "S-06C"}, headers=AUTH)
-    assert r1.status_code == 201
-    assert r2.status_code == 201
-    assert r1.json()["passenger_id"] == r2.json()["passenger_id"]
+def test_create_booking_invalid_seat_class():
+    """Should reject invalid seat class."""
+    bad = {**BOOK_PAYLOAD, "seatClass": "BUSINESS"}
+    r = client.post("/api/bookings", json=bad)
+    assert r.status_code == 422
 
-def test_get_existing_ticket():
-    from app.main import tickets_db
-    ticket_id = list(tickets_db.keys())[0]
-    r = client.get(f"/tickets/{ticket_id}")
+def test_create_booking_missing_passengers():
+    """Should reject empty passengers list."""
+    bad = {**BOOK_PAYLOAD, "passengers": []}
+    r = client.post("/api/bookings", json=bad)
+    assert r.status_code == 422
+
+def test_create_booking_multiple_passengers():
+    """Should create booking with multiple passengers."""
+    payload = {**BOOK_PAYLOAD, "passengers": [
+        {"name": "Passenger One", "email": "one@test.com", "phone": "+94771111111"},
+        {"name": "Passenger Two", "email": "two@test.com", "phone": "+94772222222"},
+    ]}
+    r = client.post("/api/bookings", json=payload)
+    assert r.status_code == 201
+    assert len(r.json()["data"]["passengers"]) == 2
+
+# ── Get All Bookings ───────────────────────────────────────────────────────────
+def test_get_all_bookings():
+    # Create one first
+    client.post("/api/bookings", json=BOOK_PAYLOAD)
+    r = client.get("/api/bookings")
     assert r.status_code == 200
-    assert r.json()["id"] == ticket_id
+    data = r.json()
+    assert data["success"] is True
+    assert isinstance(data["data"], list)
+    assert "total" in data
+    assert "page" in data
 
-def test_get_nonexistent_ticket():
-    r = client.get("/tickets/does-not-exist")
+def test_get_bookings_filter_by_email():
+    client.post("/api/bookings", json=BOOK_PAYLOAD)
+    r = client.get("/api/bookings?email=ridmi@gmail.com")
+    assert r.status_code == 200
+    for b in r.json()["data"]:
+        assert b["contactEmail"] == "ridmi@gmail.com"
+
+def test_get_bookings_filter_by_status():
+    client.post("/api/bookings", json=BOOK_PAYLOAD)
+    r = client.get("/api/bookings?status=CONFIRMED")
+    assert r.status_code == 200
+    for b in r.json()["data"]:
+        assert b["status"] == "CONFIRMED"
+
+def test_get_bookings_pagination():
+    r = client.get("/api/bookings?page=1&limit=5")
+    assert r.status_code == 200
+    assert len(r.json()["data"]) <= 5
+
+# ── Get Booking by ID ──────────────────────────────────────────────────────────
+def test_get_booking_by_id():
+    created = client.post("/api/bookings", json=BOOK_PAYLOAD)
+    booking_id = created.json()["data"]["id"]
+    r = client.get(f"/api/bookings/{booking_id}")
+    assert r.status_code == 200
+    assert r.json()["data"]["id"] == booking_id
+
+def test_get_booking_by_id_not_found():
+    r = client.get("/api/bookings/nonexistent-id-12345")
     assert r.status_code == 404
 
-def test_cancel_ticket():
-    book = client.post("/tickets/book", json=BOOK_PAYLOAD, headers=AUTH)
-    assert book.status_code == 201
-    ticket_id = book.json()["id"]
-    headers = AUTH.copy() if 'AUTH' in locals() or 'AUTH' in globals() else {}
-    cancel = client.request(
-        "DELETE",
-        f"/tickets/{ticket_id}",
-        json={"reason": "Test"},
-        headers=headers
-    )
-    assert cancel.status_code == 200
-    assert "cancelled" in cancel.json()["message"].lower()
+# ── Get Booking by Reference ───────────────────────────────────────────────────
+def test_get_booking_by_reference():
+    created = client.post("/api/bookings", json=BOOK_PAYLOAD)
+    ref = created.json()["data"]["bookingReference"]
+    r = client.get(f"/api/bookings/ref/{ref}")
+    assert r.status_code == 200
+    assert r.json()["data"]["bookingReference"] == ref
+
+def test_get_booking_by_reference_not_found():
+    r = client.get("/api/bookings/ref/BK-INVALID")
+    assert r.status_code == 404
+
+def test_get_booking_ref_case_insensitive():
+    """Reference lookup should be case-insensitive."""
+    created = client.post("/api/bookings", json=BOOK_PAYLOAD)
+    ref = created.json()["data"]["bookingReference"].lower()
+    r = client.get(f"/api/bookings/ref/{ref}")
+    assert r.status_code == 200
+
+# ── Cancel Booking ─────────────────────────────────────────────────────────────
+def test_cancel_booking():
+    created = client.post("/api/bookings", json=BOOK_PAYLOAD)
+    booking_id = created.json()["data"]["id"]
+    r = client.delete(f"/api/bookings/{booking_id}",
+                      json={"reason": "Change of plans"})
+    assert r.status_code == 200
+    assert r.json()["success"] is True
+    assert r.json()["data"]["status"] == "CANCELLED"
+    assert r.json()["data"]["cancelReason"] == "Change of plans"
 
 def test_cancel_already_cancelled():
-    book = client.post("/tickets/book", json=BOOK_PAYLOAD, headers=AUTH)
-    assert book.status_code == 201
-    ticket_id = book.json()["id"]
-    client.delete(f"/tickets/{ticket_id}", headers=AUTH)
-    r = client.delete(f"/tickets/{ticket_id}", headers=AUTH)
+    """Should return 400 if booking is already cancelled."""
+    created = client.post("/api/bookings", json=BOOK_PAYLOAD)
+    booking_id = created.json()["data"]["id"]
+    client.delete(f"/api/bookings/{booking_id}")
+    r = client.delete(f"/api/bookings/{booking_id}")
     assert r.status_code == 400
+    assert "already" in r.json()["detail"].lower()
 
-def test_get_user_tickets():
-    r = client.get("/tickets/user/user-1")
-    assert r.status_code == 200
-    assert isinstance(r.json(), list)
-
-def test_get_user_tickets_filtered_by_status():
-    r = client.get("/tickets/user/user-1?status=CONFIRMED")
-    assert r.status_code == 200
-    for t in r.json():
-        assert t["status"] == "CONFIRMED"
-
-def test_get_booking():
-    r = client.get("/bookings/BK-00001")
-    assert r.status_code == 200
-    assert r.json()["id"] == "BK-00001"
-
-def test_get_booking_not_found():
-    r = client.get("/bookings/BK-99999")
+def test_cancel_not_found():
+    r = client.delete("/api/bookings/nonexistent-id")
     assert r.status_code == 404
 
-def test_get_passenger():
-    r = client.get("/passengers/P-001", headers=AUTH)
+def test_cancel_default_reason():
+    """Should use default reason when none provided."""
+    created = client.post("/api/bookings", json=BOOK_PAYLOAD)
+    booking_id = created.json()["data"]["id"]
+    r = client.delete(f"/api/bookings/{booking_id}")
     assert r.status_code == 200
-    assert r.json()["id"] == "P-001"
+    assert r.json()["data"]["cancelReason"] is not None
